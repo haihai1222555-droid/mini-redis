@@ -152,23 +152,37 @@ export class HashTable {
   }
 
   /**
-   * 증분 순회. cursor 위치의 버킷부터 읽어 최소 count 개의 엔트리를 모은다.
-   * 끝까지 돌았으면 cursor 는 0 으로 되돌아온다.
-   * (리사이즈가 중간에 일어나면 일부를 놓치거나 중복될 수 있다. best-effort 용도)
+   * 증분 순회 (Redis SCAN 과 같은 "역순 이진 증가 커서").
+   *
+   * 커서를 1씩 올리는 대신 "비트를 뒤집은 값"을 1 올린다. 용량이 16 이면 방문 순서는
+   * 0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15 (버킷 번호의 상위 비트부터 증가).
+   *
+   * 이렇게 하면 순회 도중 테이블이 커지거나 줄어도 안전하다.
+   *   - 확장: 옛 버킷 i 의 키는 새 테이블에서 i 또는 i+옛용량 으로 갈라진다. 역순 증가는
+   *           "하위 비트를 먼저 고정"하므로, 옛 버킷을 이미 방문했다면 갈라진 두 버킷도 연달아 방문하게 된다.
+   *   - 축소: 합쳐진 버킷을 다시 방문할 수는 있지만(중복) 놓치지는 않는다.
+   * → 순회 시작부터 끝까지 계속 존재한 키는 **최소 한 번** 반환된다. (리사이즈가 있었다면 중복 가능)
+   *   순회 중에 추가/삭제된 키는 반환될 수도, 아닐 수도 있다.
+   *
+   * 커서는 "마스크하지 않은 값"을 그대로 돌려주고, 다음 호출 때의 현재 용량으로 마스크한다.
+   * 끝까지 돌았으면 cursor 는 0 으로 되돌아온다. 최소 count 개를 모을 때까지(버킷 단위) 진행한다.
    * @returns {{ cursor: number, entries: Array<[string, any]> }}
    */
   scan(cursor, count) {
     const entries = [];
-    let i = cursor >= this.#capacity ? 0 : cursor;
+    const mask = this.#capacity - 1;
+    let v = cursor >>> 0;
     do {
-      let node = this.#buckets[i];
+      let node = this.#buckets[v & mask];
       while (node !== null) {
         entries.push([node.key, node.value]);
         node = node.next;
       }
-      i++;
-    } while (i < this.#capacity && entries.length < count);
-    return { cursor: i >= this.#capacity ? 0 : i, entries };
+      // 마스크 바깥 비트를 모두 1 로 → 비트 뒤집기 → +1 → 다시 뒤집기
+      v = reverseBits32(((v | ~mask) >>> 0)) + 1;
+      v = reverseBits32(v >>> 0);
+    } while (v !== 0 && entries.length < count);
+    return { cursor: v, entries };
   }
 
   *keys() {
@@ -217,6 +231,15 @@ export class HashTable {
       longestChain,
     };
   }
+}
+
+/** 32bit 정수의 비트 순서를 뒤집는다. (최상위 비트 ↔ 최하위 비트) */
+function reverseBits32(x) {
+  x = ((x >>> 1) & 0x55555555) | ((x & 0x55555555) << 1);
+  x = ((x >>> 2) & 0x33333333) | ((x & 0x33333333) << 2);
+  x = ((x >>> 4) & 0x0f0f0f0f) | ((x & 0x0f0f0f0f) << 4);
+  x = ((x >>> 8) & 0x00ff00ff) | ((x & 0x00ff00ff) << 8);
+  return ((x >>> 16) | (x << 16)) >>> 0;
 }
 
 function nextPowerOfTwo(n) {

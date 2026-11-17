@@ -9,6 +9,7 @@
  *   FSYNC         always | everysec(기본) | no
  *   AUTH_TOKEN    지정하면 Authorization: Bearer <token> 필수
  *   MAX_KEYS      최대 키 수 (기본 무제한)
+ *   MAX_BATCH     mget/mset/transaction 한 번에 허용하는 최대 개수 (기본 1000)
  *   EVICTION      noeviction(기본) | lru — MAX_KEYS 가 가득 찼을 때 에러 / 가장 오래 안 쓴 키 축출 (lru 는 MAX_KEYS 필요)
  */
 import { MiniRedis } from '../src/store.js';
@@ -22,6 +23,7 @@ const store = new MiniRedis({
   fsync: process.env.FSYNC || 'everysec',
   maxKeys: process.env.MAX_KEYS ? Number(process.env.MAX_KEYS) : Infinity,
   evictionPolicy: process.env.EVICTION || 'noeviction',
+  maxBatch: process.env.MAX_BATCH ? Number(process.env.MAX_BATCH) : undefined,
 });
 
 const server = createServer({

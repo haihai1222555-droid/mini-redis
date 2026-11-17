@@ -24,14 +24,24 @@
  */
 import { HashTable } from './hashtable.js';
 import { Aof } from './aof.js';
-import { InvalidArgumentError, WrongTypeError, StoreFullError } from './errors.js';
+import { MiniRedisError, InvalidArgumentError, WrongTypeError, StoreFullError } from './errors.js';
 
+export const DEFAULT_MAX_BATCH = 1000; // mget / mset / transaction 한 번에 처리할 수 있는 최대 개수
+export const MAX_SCAN_COUNT = 10_000;
 export const MAX_KEY_LENGTH = 512;
 export const MAX_TAGS = 32;
 export const MAX_TTL_MS = 100 * 365 * 24 * 60 * 60 * 1000; // 100년
 
 const TTL_MISSING = -2;
 const TTL_NO_EXPIRY = -1;
+
+/** 배치/트랜잭션 안의 i 번째 항목에서 난 입력 오류에 위치를 붙여서 다시 던진다. */
+function indexed(err, name, i) {
+  if (err instanceof InvalidArgumentError) {
+    return new InvalidArgumentError(`${name}[${i}]: ${err.message}`);
+  }
+  return err;
+}
 
 function validateKey(key) {
   if (typeof key !== 'string' || key.length === 0) {
@@ -99,6 +109,8 @@ export class MiniRedis {
   #lru = false;
   #lruHead = null; // 가장 최근에 쓴 엔트리
   #lruTail = null; // 가장 오래 안 쓴 엔트리 = 축출 대상
+  #maxBatch;
+  #txBuf = null; // 배치/트랜잭션 실행 중에 모아 두는 AOF 레코드 (끝나면 한 줄로 기록)
   #aof = null;
   #aofLines = 0;
   #aofRewriteMinLines;
@@ -117,6 +129,7 @@ export class MiniRedis {
     expiredActive: 0,
     invalidated: 0,
     evicted: 0,
+    transactions: 0,
   };
   loadInfo = null;
 
@@ -131,6 +144,8 @@ export class MiniRedis {
    * @param {'noeviction'|'lru'} [options.evictionPolicy]
    *   maxKeys 가 가득 찼을 때: noeviction(기본) = StoreFullError / lru = 가장 오래 안 쓴 키를 축출.
    * @param {number} [options.aofRewriteMinLines]   이 줄 수를 넘고 살아있는 키의 2배를 넘으면 자동 compaction.
+   * @param {number} [options.maxBatch]             mget / mset / transaction 한 번에 허용하는 최대 개수.
+   *   한 번에 너무 많이 실행하면 그동안 다른 요청이 모두 대기하므로(단일 스레드) 상한을 둔다.
    */
   constructor({
     now = Date.now,
@@ -141,7 +156,11 @@ export class MiniRedis {
     maxKeys = Infinity,
     evictionPolicy = 'noeviction',
     aofRewriteMinLines = 10_000,
+    maxBatch = DEFAULT_MAX_BATCH,
   } = {}) {
+    if (!Number.isInteger(maxBatch) || maxBatch < 1) {
+      throw new InvalidArgumentError('maxBatch must be a positive integer');
+    }
     if (!['noeviction', 'lru'].includes(evictionPolicy)) {
       throw new InvalidArgumentError(`invalid evictionPolicy: ${evictionPolicy} (expected noeviction|lru)`);
     }
@@ -154,6 +173,7 @@ export class MiniRedis {
     this.#now = now;
     this.#maxKeys = maxKeys;
     this.#lru = evictionPolicy === 'lru';
+    this.#maxBatch = maxBatch;
     this.#sweepBatch = sweepBatch;
     this.#aofRewriteMinLines = aofRewriteMinLines;
     this.#startedAt = now();
@@ -284,9 +304,33 @@ export class MiniRedis {
 
   #log(record) {
     if (this.#aof === null) return;
+    if (this.#txBuf !== null) {
+      this.#txBuf.push(record); // 배치/트랜잭션 중: 모아 뒀다가 끝나면 한 번에 기록
+      return;
+    }
+    this.#appendLog(record);
+  }
+
+  #appendLog(record) {
     this.#aof.append(record);
     this.#aofLines++;
     this.#maybeCompact();
+  }
+
+  /**
+   * fn 이 만드는 모든 AOF 레코드를 {"o":"t","r":[…]} **한 줄**로 묶어 기록한다.
+   * 한 줄은 "온전히 기록됐거나, 쓰다 만 줄(복구 때 통째로 버려짐)" 둘 중 하나이므로
+   * 크래시가 나도 트랜잭션이 절반만 복구되는 일이 없다.
+   */
+  #batch(fn) {
+    this.#txBuf = [];
+    try {
+      return fn();
+    } finally {
+      const buf = this.#txBuf;
+      this.#txBuf = null;
+      if (buf.length > 0) this.#appendLog(buf.length === 1 ? buf[0] : { o: 't', r: buf });
+    }
   }
 
   #maybeCompact() {
@@ -326,6 +370,13 @@ export class MiniRedis {
         this.#tagIndex.clear();
         this.#lruReset();
         return;
+      case 't': // 트랜잭션/배치: 안에 든 레코드를 순서대로 재생
+        if (Array.isArray(rec.r)) {
+          for (const inner of rec.r) {
+            if (inner !== null && typeof inner === 'object') this.#replay(inner);
+          }
+        }
+        return;
       default:
       // 알 수 없는 레코드는 무시 (상위 버전 호환)
     }
@@ -333,16 +384,20 @@ export class MiniRedis {
 
   #ensureCapacity() {
     if (this.#table.size < this.#maxKeys) return;
-    // 가득 찼다면 만료된 키부터 정리해 본다 (최대 초당 1회, 연속된 O(n) 스캔 방지).
-    const now = this.#now();
-    if (now - this.#lastFullSweep >= 1000) {
-      this.#lastFullSweep = now;
-      this.#sweepAll();
-    }
+    this.#sweepIfDue();
     // 만료 키를 정리해도 여전히 가득 차 있다면: lru 는 가장 오래 안 쓴 키를 버리고, noeviction 은 거부.
     this.#evictToFit(this.#maxKeys - 1);
     if (this.#table.size >= this.#maxKeys) {
       throw new StoreFullError(`store is full (maxKeys=${this.#maxKeys})`);
+    }
+  }
+
+  /** 가득 찼을 때 만료 키부터 정리해 본다 (최대 초당 1회 — 가득 찬 상태로 요청이 몰려도 연속 O(n) 방지). */
+  #sweepIfDue() {
+    const now = this.#now();
+    if (now - this.#lastFullSweep >= 1000) {
+      this.#lastFullSweep = now;
+      this.#sweepAll();
     }
   }
 
@@ -367,19 +422,36 @@ export class MiniRedis {
    */
   set(key, value, opts = {}) {
     this.#assertOpen();
+    return this.#applySet(this.#prepareSet(key, value, opts));
+  }
+
+  /** 1단계: 입력 검증·정규화만 한다 (저장소를 건드리지 않음). 배치/트랜잭션이 "전부 검증한 뒤 실행"하는 데 쓴다. */
+  #prepareSet(key, value, opts) {
     const { ttlMs, tags, nx = false, xx = false } = opts;
     validateKey(key);
+    if (typeof nx !== 'boolean' || typeof xx !== 'boolean') {
+      throw new InvalidArgumentError('nx and xx must be booleans');
+    }
     if (nx && xx) throw new InvalidArgumentError('nx and xx cannot be used together');
-    const normalized = normalizeValue(value);
-    const expiresAt = ttlMs === undefined ? null : this.#now() + validateTtlMs(ttlMs);
-    const normalizedTags = normalizeTags(tags);
+    return {
+      key,
+      value: normalizeValue(value),
+      ttl: ttlMs === undefined ? null : validateTtlMs(ttlMs),
+      tags: normalizeTags(tags),
+      nx,
+      xx,
+    };
+  }
 
-    const existing = this.#live(key);
-    if (nx && existing !== undefined) return false;
-    if (xx && existing === undefined) return false;
+  /** 2단계: 검증된 입력을 저장소에 반영한다. */
+  #applySet(p) {
+    const existing = this.#live(p.key);
+    if (p.nx && existing !== undefined) return false;
+    if (p.xx && existing === undefined) return false;
     if (existing === undefined) this.#ensureCapacity();
 
-    this.#put(key, { value: normalized, expiresAt, tags: normalizedTags });
+    const expiresAt = p.ttl === null ? null : this.#now() + p.ttl;
+    this.#put(p.key, { value: p.value, expiresAt, tags: p.tags });
     this.#stats.sets++;
     return true;
   }
@@ -497,7 +569,250 @@ export class MiniRedis {
     return result;
   }
 
+  // ───────────────────────── 배치 / SCAN / 트랜잭션 ─────────────────────────
+
+  #checkBatch(list, name) {
+    if (!Array.isArray(list)) throw new InvalidArgumentError(`${name} must be an array`);
+    if (list.length > this.#maxBatch) {
+      throw new InvalidArgumentError(`too many ${name} (max ${this.#maxBatch} per request)`);
+    }
+  }
+
+  /**
+   * 여러 키를 한 번에 읽는다. 전부 한 번의 동기 실행이므로 **서로 일관된 스냅샷**이다
+   * (읽는 도중에 다른 요청이 값을 바꿀 수 없다).
+   * 하나라도 잘못된 키가 있으면 아무것도 읽지 않고 에러.
+   * @returns {Array<{ value: *, ttlMs: number|null } | undefined>} keys 와 같은 순서. 없거나 만료면 undefined
+   */
+  mget(keys) {
+    this.#assertOpen();
+    this.#checkBatch(keys, 'keys');
+    for (const [i, key] of keys.entries()) {
+      try {
+        validateKey(key);
+      } catch (err) {
+        throw indexed(err, 'keys', i);
+      }
+    }
+    return keys.map((key) => this.inspect(key));
+  }
+
+  /**
+   * 여러 키를 한 번에 저장한다. **전부 저장되거나 전부 거부된다.**
+   *   1. 모든 항목을 먼저 검증 (하나라도 잘못이면 아무것도 저장하지 않음)
+   *   2. 공간이 모자라면(noeviction) 아무것도 저장하지 않고 StoreFullError
+   *   3. 한 번의 동기 실행으로 전부 반영 → 중간 상태를 다른 요청이 볼 수 없다
+   *   4. AOF 에는 한 줄로 기록 → 크래시가 나도 일부만 복구되지 않는다
+   * 같은 키가 여러 번 나오면 뒤의 것이 이긴다.
+   * @param {Array<{ key: string, value: *, ttlMs?: number, tags?: string[] }>} entries
+   * @returns {number} 저장한 항목 수
+   */
+  mset(entries) {
+    this.#assertOpen();
+    this.#checkBatch(entries, 'entries');
+    const prepared = entries.map((entry, i) => {
+      try {
+        if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+          throw new InvalidArgumentError('entry must be an object');
+        }
+        if (entry.nx !== undefined || entry.xx !== undefined) {
+          throw new InvalidArgumentError('nx/xx are not supported in mset (use a transaction)');
+        }
+        return this.#prepareSet(entry.key, entry.value, entry);
+      } catch (err) {
+        throw indexed(err, 'entries', i);
+      }
+    });
+    this.#reserveFor(prepared.map((p) => p.key));
+    this.#batch(() => {
+      for (const p of prepared) this.#applySet(p);
+    });
+    return prepared.length;
+  }
+
+  /** mset 이 시작하기 전에 공간을 확인해서, 중간에 StoreFullError 로 일부만 저장되는 일을 막는다. */
+  #reserveFor(keys) {
+    if (this.#maxKeys === Infinity) return;
+    const distinct = new Set(keys);
+    if (distinct.size > this.#maxKeys) {
+      throw new StoreFullError(`batch has ${distinct.size} distinct keys but maxKeys=${this.#maxKeys}`);
+    }
+    if (this.#lru) return; // lru 는 필요한 만큼 오래된 키를 축출하면 되므로 항상 들어간다
+    const countFresh = () => {
+      let n = 0;
+      for (const key of distinct) if (this.#live(key) === undefined) n++;
+      return n;
+    };
+    let fresh = countFresh();
+    if (this.#table.size + fresh > this.#maxKeys) {
+      this.#sweepIfDue(); // 만료 키를 치우면 들어갈 수도 있다
+      fresh = countFresh();
+    }
+    if (this.#table.size + fresh > this.#maxKeys) {
+      throw new StoreFullError(`store is full (maxKeys=${this.#maxKeys})`);
+    }
+  }
+
+  /**
+   * 커서 기반 키 순회 (Redis SCAN). `keys()` 와 달리 한 번에 조금씩만 훑으므로
+   * 키가 아무리 많아도 그동안 다른 요청을 오래 막지 않는다. cursor 0 으로 시작해서
+   * 돌려받은 cursor 가 다시 0 이 되면 끝.
+   *
+   * 보장: 순회를 시작해서 끝낼 때까지 계속 존재한 키는 **최소 한 번** 나온다.
+   *       (중간에 테이블이 리사이즈되면 같은 키가 두 번 나올 수 있다)
+   * 주의: count 는 "한 번에 검사할 엔트리 수"이지 "반환 개수"가 아니다. prefix 로 걸러지면
+   *       한 페이지가 비어 있어도 cursor 가 0 이 아니면 계속 호출해야 한다.
+   * @returns {{ cursor: number, keys: string[] }}
+   */
+  scan(cursor = 0, { count = 100, prefix = '' } = {}) {
+    this.#assertOpen();
+    if (!Number.isInteger(cursor) || cursor < 0 || cursor > 0xffffffff) {
+      throw new InvalidArgumentError('cursor must be an integer between 0 and 4294967295');
+    }
+    if (!Number.isInteger(count) || count < 1 || count > MAX_SCAN_COUNT) {
+      throw new InvalidArgumentError(`count must be an integer between 1 and ${MAX_SCAN_COUNT}`);
+    }
+    if (typeof prefix !== 'string') throw new InvalidArgumentError('prefix must be a string');
+
+    const { cursor: next, entries } = this.#table.scan(cursor, count);
+    const now = this.#now();
+    const keys = [];
+    for (const [key, entry] of entries) {
+      if (this.#isExpired(entry, now)) {
+        this.#remove(key, entry); // 순회하다 만난 만료 키는 그 자리에서 정리 (entries 는 스냅샷이라 안전)
+        this.#stats.expiredLazy++;
+        continue;
+      }
+      if (key.startsWith(prefix)) keys.push(key);
+    }
+    return { cursor: next, keys };
+  }
+
+  /**
+   * 트랜잭션: 여러 명령을 **끼어들기 없이 연달아** 실행한다 (Redis 의 MULTI/EXEC).
+   *
+   * 동작 규칙 (Redis 와 동일한 모델)
+   *   - 격리(isolation): 전부 한 번의 동기 실행이므로 다른 요청이 중간에 끼어들 수 없다.
+   *   - 사전 검증: 명령 하나라도 형식이 잘못이면(모르는 cmd, 잘못된 key/ttl 등) **아무것도 실행하지 않고** 에러.
+   *   - 실행 중 오류(WRONG_TYPE, STORE_FULL 등)는 **롤백하지 않는다.** 그 명령만 실패로 기록하고 나머지는 계속 실행.
+   *     (실행 시점의 값에 따라 달라지는 오류는 미리 알 수 없기 때문. Redis 도 롤백하지 않는다.)
+   *   - AOF: 결과적으로 반영된 변경 전체를 한 줄로 기록 → 크래시 시 통째로 복구되거나 통째로 버려진다.
+   *
+   * 명령: set / get / del / exists / incr / ttl / expire / persist / invalidate
+   *   { cmd: 'set', key, value, ttlMs?, tags?, nx?, xx? }   { cmd: 'incr', key, by? }
+   *   { cmd: 'expire', key, ttlMs }   { cmd: 'invalidate', key | prefix | tag | all }   { cmd: 'get', key } …
+   * @returns {Array<{ ok: true, ... } | { ok: false, error: { code, message, status } }>} 명령과 같은 순서
+   */
+  transaction(commands) {
+    this.#assertOpen();
+    this.#checkBatch(commands, 'commands');
+    const prepared = commands.map((command, i) => {
+      try {
+        return this.#prepareCommand(command);
+      } catch (err) {
+        throw indexed(err, 'commands', i);
+      }
+    });
+    this.#stats.transactions++;
+    return this.#batch(() =>
+      prepared.map((p) => {
+        try {
+          return { ok: true, ...this.#runCommand(p) };
+        } catch (err) {
+          if (err instanceof MiniRedisError) {
+            return { ok: false, error: { code: err.code, message: err.message, status: err.status } };
+          }
+          throw err; // 예상 못 한 버그는 숨기지 않는다
+        }
+      }),
+    );
+  }
+
+  #prepareCommand(c) {
+    if (c === null || typeof c !== 'object' || Array.isArray(c)) {
+      throw new InvalidArgumentError('command must be an object');
+    }
+    switch (c.cmd) {
+      case 'set':
+        return { cmd: 'set', set: this.#prepareSet(c.key, c.value, c) };
+      case 'get':
+      case 'del':
+      case 'exists':
+      case 'ttl':
+      case 'persist':
+        validateKey(c.key);
+        return { cmd: c.cmd, key: c.key };
+      case 'incr': {
+        validateKey(c.key);
+        const by = c.by ?? 1;
+        if (!Number.isSafeInteger(by)) throw new InvalidArgumentError('increment must be a safe integer');
+        return { cmd: 'incr', key: c.key, by };
+      }
+      case 'expire':
+        validateKey(c.key);
+        return { cmd: 'expire', key: c.key, ttlMs: validateTtlMs(c.ttlMs) };
+      case 'invalidate':
+        return {
+          cmd: 'invalidate',
+          criteria: this.#parseCriteria({ key: c.key, prefix: c.prefix, tag: c.tag, all: c.all }),
+        };
+      default:
+        throw new InvalidArgumentError(`unknown command: ${String(c.cmd)}`);
+    }
+  }
+
+  #runCommand(p) {
+    switch (p.cmd) {
+      case 'set':
+        return { stored: this.#applySet(p.set) };
+      case 'get': {
+        const found = this.inspect(p.key);
+        return found === undefined ? { found: false } : { found: true, value: found.value };
+      }
+      case 'del':
+        return { deleted: this.del(p.key) };
+      case 'exists':
+        return { exists: this.exists(p.key) };
+      case 'incr':
+        return { value: this.incr(p.key, p.by) };
+      case 'ttl': {
+        const ttl = this.ttl(p.key);
+        return ttl === TTL_MISSING ? { found: false } : { found: true, ttlMs: ttl === TTL_NO_EXPIRY ? null : ttl };
+      }
+      case 'expire':
+        return { updated: this.expire(p.key, p.ttlMs) };
+      case 'persist':
+        return { persisted: this.persist(p.key) };
+      case 'invalidate':
+        return { invalidated: this.#invalidateParsed(p.criteria) };
+      default:
+        throw new Error(`unreachable: ${p.cmd}`);
+    }
+  }
+
   // ───────────────────────── 무효화 ─────────────────────────
+
+  /** 무효화 기준이 "정확히 하나"이고 형식이 맞는지 검증해서 { type, value } 로 돌려준다. */
+  #parseCriteria(criteria) {
+    if (criteria === null || typeof criteria !== 'object') {
+      throw new InvalidArgumentError('invalidate requires one of: key, prefix, tag, all');
+    }
+    const specified = ['key', 'prefix', 'tag', 'all'].filter((k) => criteria[k] !== undefined);
+    if (specified.length !== 1) {
+      throw new InvalidArgumentError('invalidate requires exactly one of: key, prefix, tag, all');
+    }
+    const type = specified[0];
+    const value = criteria[type];
+    if (type === 'key') validateKey(value);
+    else if (type === 'prefix' || type === 'tag') {
+      if (typeof value !== 'string' || value.length === 0) {
+        throw new InvalidArgumentError(`${type} must be a non-empty string`);
+      }
+    } else if (value !== true) {
+      throw new InvalidArgumentError('all must be true');
+    }
+    return { type, value };
+  }
 
   /**
    * 캐시 무효화. 정확히 하나의 기준을 지정한다.
@@ -509,14 +824,10 @@ export class MiniRedis {
    */
   invalidate(criteria) {
     this.#assertOpen();
-    if (criteria === null || typeof criteria !== 'object') {
-      throw new InvalidArgumentError('invalidate requires one of: key, prefix, tag, all');
-    }
-    const specified = ['key', 'prefix', 'tag', 'all'].filter((k) => criteria[k] !== undefined);
-    if (specified.length !== 1) {
-      throw new InvalidArgumentError('invalidate requires exactly one of: key, prefix, tag, all');
-    }
+    return this.#invalidateParsed(this.#parseCriteria(criteria));
+  }
 
+  #invalidateParsed({ type, value }) {
     let count = 0;
     const drop = (key) => {
       const entry = this.#live(key);
@@ -526,24 +837,16 @@ export class MiniRedis {
       count++;
     };
 
-    if (criteria.key !== undefined) {
-      validateKey(criteria.key);
-      drop(criteria.key);
-    } else if (criteria.prefix !== undefined) {
-      if (typeof criteria.prefix !== 'string' || criteria.prefix.length === 0) {
-        throw new InvalidArgumentError('prefix must be a non-empty string');
-      }
+    if (type === 'key') {
+      drop(value);
+    } else if (type === 'prefix') {
       for (const key of [...this.#table.keys()]) {
-        if (key.startsWith(criteria.prefix)) drop(key);
+        if (key.startsWith(value)) drop(key);
       }
-    } else if (criteria.tag !== undefined) {
-      if (typeof criteria.tag !== 'string' || criteria.tag.length === 0) {
-        throw new InvalidArgumentError('tag must be a non-empty string');
-      }
-      const keys = this.#tagIndex.get(criteria.tag);
+    } else if (type === 'tag') {
+      const keys = this.#tagIndex.get(value);
       if (keys !== undefined) for (const key of [...keys]) drop(key);
     } else {
-      if (criteria.all !== true) throw new InvalidArgumentError('all must be true');
       count = this.#countLive();
       this.#table.clear();
       this.#tagIndex.clear();
