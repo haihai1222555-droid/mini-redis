@@ -114,6 +114,30 @@ function isValidRecordTags(t) {
   );
 }
 
+/**
+ * AOF 레코드 하나가 형식에 맞는지 검사한다 (적용은 하지 않음).
+ * 트랜잭션(t) 은 안에 든 레코드까지 전부 검사한다 — 복구할 때도 "통째로 적용 or 통째로 무시" 를 지키기 위해
+ * 적용하기 전에 먼저 검증해야 한다. 트랜잭션 안에 트랜잭션은 쓰지 않으므로 중첩은 잘못된 것으로 본다.
+ */
+function isValidRecord(rec, { inTx = false } = {}) {
+  if (rec === null || typeof rec !== 'object' || Array.isArray(rec) || typeof rec.o !== 'string') return false;
+  switch (rec.o) {
+    case 'p': {
+      if (!isValidRecordKey(rec.k) || rec.v === undefined) return false;
+      const e = rec.e ?? null;
+      if (e !== null && !Number.isFinite(e)) return false;
+      const t = rec.t ?? null;
+      return t === null || isValidRecordTags(t);
+    }
+    case 'd':
+      return isValidRecordKey(rec.k);
+    case 't':
+      return !inTx && Array.isArray(rec.r) && rec.r.every((inner) => isValidRecord(inner, { inTx: true }));
+    default:
+      return true; // 'f' 와 알 수 없는 레코드(상위 버전 호환)
+  }
+}
+
 export class MiniRedis {
   #table = new HashTable();
   #tagIndex = new Map(); // tag -> Set<key>
@@ -360,51 +384,49 @@ export class MiniRedis {
    * AOF 레코드 하나를 메모리에 적용한다.
    * JSON 으로는 올바르지만 필드가 잘못된 레코드(수동 편집, 디스크 손상 등)는 적용하지 않고 false 를 반환한다.
    * → Aof.load 가 skipped 로 세고, 서버는 죽지 않으며 내부 상태(태그 인덱스 등)도 오염되지 않는다.
+   * 트랜잭션(t) 은 안에 든 레코드가 하나라도 잘못이면 아무것도 적용하지 않는다 (반쪽 복구 방지).
    * @returns {boolean} 적용(또는 알 수 없는 레코드라 무시)했으면 true, 잘못된 레코드라 건너뛰었으면 false
    */
   #replay(rec) {
+    if (!isValidRecord(rec)) return false;
+    this.#applyRecord(rec);
+    return true;
+  }
+
+  /** 검증을 통과한 레코드를 적용한다. */
+  #applyRecord(rec) {
     switch (rec.o) {
       case 'p': {
-        if (!isValidRecordKey(rec.k) || rec.v === undefined) return false;
         const e = rec.e ?? null;
-        if (e !== null && !Number.isFinite(e)) return false;
         const tags = rec.t ?? null;
-        if (tags !== null && !isValidRecordTags(tags)) return false;
-
         if (e !== null && e <= this.#now()) {
           // 서버가 꺼진 사이 만료된 키 → 복원하지 않는다. (이전 값이 있었다면 그것도 지운다)
           const old = this.#table.get(rec.k);
           if (old !== undefined) this.#remove(rec.k, old);
-          return true;
+          return;
         }
         this.#put(
           rec.k,
           { value: rec.v, expiresAt: e, tags: tags === null || tags.length === 0 ? null : [...new Set(tags)] },
           { log: false },
         );
-        return true;
+        return;
       }
       case 'd': {
-        if (!isValidRecordKey(rec.k)) return false;
         const old = this.#table.get(rec.k);
         if (old !== undefined) this.#remove(rec.k, old);
-        return true;
+        return;
       }
       case 'f':
         this.#table.clear();
         this.#tagIndex.clear();
         this.#lruReset();
-        return true;
-      case 't': // 트랜잭션/배치: 안에 든 레코드를 순서대로 재생
-        if (Array.isArray(rec.r)) {
-          for (const inner of rec.r) {
-            if (inner !== null && typeof inner === 'object') this.#replay(inner);
-          }
-        }
+        return;
+      case 't': // 트랜잭션/배치: 이미 전부 검증됐으므로 안에 든 레코드를 순서대로 적용
+        for (const inner of rec.r) this.#applyRecord(inner);
         return;
       default:
-        // 알 수 없는 레코드는 무시 (상위 버전 호환)
-        return true;
+      // 알 수 없는 레코드는 무시 (상위 버전 호환)
     }
   }
 

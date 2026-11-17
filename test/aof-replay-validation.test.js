@@ -112,3 +112,67 @@ test('replay: 잘못된 레코드 이후의 정상 레코드도 모두 복원된
     },
   );
 });
+
+// ───────── 트랜잭션 레코드 {"o":"t","r":[…]} ─────────
+// 트랜잭션은 복구할 때도 "통째로 적용 or 통째로 무시" 여야 한다 (반쪽 복구 금지).
+
+const P = (k, v) => `{"o":"p","k":"${k}","v":${v},"e":null,"t":null}`;
+const T = (...inner) => `{"o":"t","r":[${inner.join(',')}]}`;
+
+test('replay(t): 정상 트랜잭션은 안의 레코드를 순서대로 모두 적용', () => {
+  withAof([T(P('x', 1), P('y', 2), '{"o":"d","k":"x"}')], (s) => {
+    assert.equal(s.exists('x'), false);
+    assert.equal(s.get('y'), 2);
+    assert.equal(s.loadInfo.skipped, 0);
+    assert.equal(s.loadInfo.records, 1);
+  });
+});
+
+test('replay(t): 안에 잘못된 레코드가 하나라도 있으면 아무것도 적용하지 않고 skipped 로 센다', () => {
+  withAof([A, T(P('x', 1), '{"o":"d"}', P('y', 2)), B], (s) => {
+    assert.equal(s.exists('x'), false, '앞쪽 레코드도 적용되면 안 된다');
+    assert.equal(s.exists('y'), false, '뒤쪽 레코드도 적용되면 안 된다');
+    assert.equal(s.get('a'), 1, '트랜잭션 밖의 레코드는 그대로 복원');
+    assert.equal(s.get('b'), 2);
+    assert.equal(s.loadInfo.skipped, 1);
+    assert.equal(s.loadInfo.records, 2);
+  });
+});
+
+test('replay(t): 마지막 레코드만 잘못돼도(tags 숫자) 앞의 레코드까지 통째로 무시', () => {
+  withAof([T(P('x', 1), '{"o":"p","k":"y","v":2,"e":null,"t":5}')], (s) => {
+    assert.equal(s.size, 0);
+    assert.equal(s.stats().tags, 0);
+    assert.equal(s.loadInfo.skipped, 1);
+  });
+});
+
+test('replay(t): r 이 배열이 아니거나 없으면 건너뛴다', () => {
+  withAof([A, '{"o":"t","r":"garbage"}', '{"o":"t"}', '{"o":"t","r":{"0":1}}'], (s) => {
+    assert.equal(s.get('a'), 1);
+    assert.equal(s.loadInfo.skipped, 3);
+  });
+});
+
+test('replay(t): 안에 객체가 아닌 원소(null / 숫자 / 배열)가 있으면 건너뛴다', () => {
+  withAof([T(P('x', 1), 'null'), T(P('y', 1), '7'), T(P('z', 1), '[1]')], (s) => {
+    assert.equal(s.size, 0);
+    assert.equal(s.loadInfo.skipped, 3);
+  });
+});
+
+test('replay(t): 트랜잭션 안의 트랜잭션(중첩)은 잘못된 레코드로 본다', () => {
+  withAof([T(P('x', 1), T(P('y', 2)))], (s) => {
+    assert.equal(s.size, 0);
+    assert.equal(s.loadInfo.skipped, 1);
+  });
+});
+
+test('replay(t): 빈 트랜잭션 / 안의 flush / 알 수 없는 o 는 정상 처리', () => {
+  withAof([A, T(), T('{"o":"f"}', P('x', 1)), T('{"o":"future-op","k":"q"}', P('y', 2))], (s) => {
+    assert.equal(s.exists('a'), false, 'flush 가 적용됨');
+    assert.equal(s.get('x'), 1);
+    assert.equal(s.get('y'), 2);
+    assert.equal(s.loadInfo.skipped, 0);
+  });
+});
