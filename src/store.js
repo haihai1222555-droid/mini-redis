@@ -91,6 +91,19 @@ function normalizeTags(tags) {
   return unique.length > 0 ? unique : null;
 }
 
+/** AOF 복구용 검증: 예외를 던지지 않고 boolean 만 반환한다. */
+function isValidRecordKey(k) {
+  return typeof k === 'string' && k.length > 0 && k.length <= MAX_KEY_LENGTH;
+}
+
+function isValidRecordTags(t) {
+  return (
+    Array.isArray(t) &&
+    t.length <= MAX_TAGS &&
+    t.every((tag) => typeof tag === 'string' && tag.length > 0 && tag.length <= MAX_KEY_LENGTH)
+  );
+}
+
 export class MiniRedis {
   #table = new HashTable();
   #tagIndex = new Map(); // tag -> Set<key>
@@ -299,35 +312,48 @@ export class MiniRedis {
     }
   }
 
+  /**
+   * AOF 레코드 하나를 메모리에 적용한다.
+   * JSON 으로는 올바르지만 필드가 잘못된 레코드(수동 편집, 디스크 손상 등)는 적용하지 않고 false 를 반환한다.
+   * → Aof.load 가 skipped 로 세고, 서버는 죽지 않으며 내부 상태(태그 인덱스 등)도 오염되지 않는다.
+   * @returns {boolean} 적용(또는 알 수 없는 레코드라 무시)했으면 true, 잘못된 레코드라 건너뛰었으면 false
+   */
   #replay(rec) {
     switch (rec.o) {
       case 'p': {
-        if (typeof rec.k !== 'string') return;
-        if (typeof rec.e === 'number' && rec.e <= this.#now()) {
+        if (!isValidRecordKey(rec.k) || rec.v === undefined) return false;
+        const e = rec.e ?? null;
+        if (e !== null && !Number.isFinite(e)) return false;
+        const tags = rec.t ?? null;
+        if (tags !== null && !isValidRecordTags(tags)) return false;
+
+        if (e !== null && e <= this.#now()) {
           // 서버가 꺼진 사이 만료된 키 → 복원하지 않는다. (이전 값이 있었다면 그것도 지운다)
           const old = this.#table.get(rec.k);
           if (old !== undefined) this.#remove(rec.k, old);
-          return;
+          return true;
         }
         this.#put(
           rec.k,
-          { value: rec.v, expiresAt: typeof rec.e === 'number' ? rec.e : null, tags: rec.t ?? null },
+          { value: rec.v, expiresAt: e, tags: tags === null || tags.length === 0 ? null : [...new Set(tags)] },
           { log: false },
         );
-        return;
+        return true;
       }
       case 'd': {
+        if (!isValidRecordKey(rec.k)) return false;
         const old = this.#table.get(rec.k);
         if (old !== undefined) this.#remove(rec.k, old);
-        return;
+        return true;
       }
       case 'f':
         this.#table.clear();
         this.#tagIndex.clear();
         this.#lruReset();
-        return;
+        return true;
       default:
-      // 알 수 없는 레코드는 무시 (상위 버전 호환)
+        // 알 수 없는 레코드는 무시 (상위 버전 호환)
+        return true;
     }
   }
 

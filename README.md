@@ -4,7 +4,7 @@
 **외부 의존성이 없습니다** (Node.js 20+ 내장 모듈만 사용: `node:http`, `node:test`, `fetch`).
 
 ```bash
-npm test            # 단위 + 기능 테스트 (102개)
+npm test            # 단위 + 기능 테스트 (111개)
 npm start           # Mini Redis 서버 (기본 http://127.0.0.1:6380)
 npm run demo        # 데모 API(캐시 적용 :4000 / 캐시 없음 :4001) 실행
 npm run bench       # 캐시 사용 vs 미사용 성능 비교
@@ -175,13 +175,14 @@ const { value, hit } = await cache.getOrSet('product:7', () => db.findProduct(7)
 - **loader 에러는 캐시하지 않고** 그대로 전달
 - **negative caching** — loader 가 `null` 을 반환하면 `null` 도 (짧은 TTL 로) 캐시 → 없는 id 반복 조회로 DB 가 뚫리는 cache penetration 방지
 
-## 8. 테스트 (`npm test` — 102개)
+## 8. 테스트 (`npm test` — 111개)
 
 | 파일 | 내용 |
 |---|---|
 | `hashtable.test.js` | 해시 벡터, 충돌(체이닝 머리/중간/꼬리 삭제), 확장/축소, 용량 2의 거듭제곱, scan 완전성, 분포, **무작위 연산 5만 회를 `Map` 과 비교하는 속성 테스트** |
 | `store.test.js` | 저장/조회/삭제, 타입 보존, null vs 없음, 값 격리, 입력 검증, NX/XX, **가짜 시계로 TTL 경계**, lazy/active 만료, INCR, 무효화(key/prefix/tag/all), maxKeys, 5만 키 |
 | `aof.test.js` | 재시작 복원, 오프라인 중 만료 키 미복원, 잘린 마지막 줄/깨진 줄 복구, compaction, **`SIGKILL` 후 복구** |
+| `aof-replay-validation.test.js` | 필드가 잘못된 AOF 레코드(키 없음/비문자열 키, 잘못된 tags·만료 시각, 값 누락)를 만나도 죽지 않고 건너뛰어 `skipped` 로 세며, 태그 인덱스가 오염되지 않음 |
 | `server.test.js` | CRUD, 특수문자/유니코드/슬래시 키, 만료 후 404, 입력 검증, 413, 인증, **500 동시 INCR / 100 동시 NX / 혼합 동시 요청**, 무효화, 에러 비노출 |
 | `client.test.js` | 클라이언트 전 기능, stampede, fail-open(서버 다운 / 응답 없음), negative caching, **데모 API 연동**(HIT/MISS, 수정 시 무효화, 태그 무효화, TTL 만료 후 재조회) |
 
