@@ -45,6 +45,7 @@ export class Aof {
 
   /**
    * 파일을 읽어 각 레코드를 onRecord 로 전달한 뒤, 이후 append 를 위해 파일을 연다.
+   * onRecord 가 false 를 반환한 레코드(필드가 잘못된 레코드)는 skipped 로 센다.
    * @returns {{ records: number, skipped: number, truncatedBytes: number }}
    */
   load(onRecord) {
@@ -78,7 +79,11 @@ export class Aof {
           skipped++;
           continue;
         }
-        onRecord(record);
+        // onRecord 가 false 를 반환하면 의미상 잘못된 레코드 → 건너뛴 것으로 센다.
+        if (onRecord(record) === false) {
+          skipped++;
+          continue;
+        }
         records++;
       }
     }
