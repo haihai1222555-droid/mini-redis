@@ -166,7 +166,7 @@ Mini Redis가 은행 앱이라는 뜻이 아니라, "명령 두 개를 한 덩�
 
 - [ ] 스톱워치로 **본문 대본만** 읽어서 3분 30초 안에 들어오는지 (시연과 Q&A는 시간에 포함되지 않음)
 - [ ] **수치를 내 PC 결과로 교체:** `npm run bench:batch`, `npm run demo:tx`를 미리 실행해서 [presentation.md](./presentation.md)와 이 대본의 숫자(76 → 2.3ms, 111 → 2.2ms, 160 → 0번)를 확인·수정. `demo:tx`의 160번은 실행할 때마다 달라집니다.
-- [ ] `npm test` 통과 (146개)
+- [ ] `npm test` 통과 (162개)
 - [ ] 시연은 **선택**입니다. 시간이 없으니 하나만 한다면 트랜잭션(`npm run demo:tx`)이 가장 효과가 큽니다. PowerShell에서는 `curl`이 아니라 **`curl.exe`**
 
 ## 말하기 팁
