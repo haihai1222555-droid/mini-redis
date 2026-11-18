@@ -4,7 +4,7 @@
 **외부 의존성이 없습니다** (Node.js 20+ 내장 모듈만 사용: `node:http`, `node:test`, `fetch`).
 
 ```bash
-npm test            # 단위 + 기능 테스트 (155개)
+npm test            # 단위 + 기능 테스트 (162개)
 npm start           # Mini Redis 서버 (기본 http://127.0.0.1:6380)
 npm run demo        # 데모 API(캐시 적용 :4000 / 캐시 없음 :4001) 실행
 npm run bench       # 캐시 사용 vs 미사용 성능 비교
@@ -227,14 +227,14 @@ for await (const key of cache.scanKeys({ prefix: 'user:' })) { … }
 
 `npm run bench:batch`(키 1,000개, 같은 머신의 keep-alive HTTP): 하나씩 읽기 76ms → `mget` 2.3ms, 하나씩 쓰기 111ms → `mset` 2.2ms (약 30~50배). 절대값은 머신마다 다르고, 서버가 원격이면 요청마다 왕복 지연이 붙어 차이가 더 벌어집니다.
 
-## 8. 테스트 (`npm test` — 155개)
+## 8. 테스트 (`npm test` — 162개)
 
 | 파일 | 내용 |
 |---|---|
 | `hashtable.test.js` | 해시 벡터, 충돌(체이닝 머리/중간/꼬리 삭제), 확장/축소, 용량 2의 거듭제곱, scan 완전성, **scan 도중 확장/축소해도 키를 놓치지 않음**, 분포, **무작위 연산 5만 회를 `Map` 과 비교하는 속성 테스트** |
 | `store.test.js` | 저장/조회/삭제, 타입 보존, null vs 없음, 값 격리, 입력 검증, NX/XX, **가짜 시계로 TTL 경계**, lazy/active 만료, INCR, 무효화(key/prefix/tag/all), maxKeys, 5만 키 |
 | `aof.test.js` | 재시작 복원, 오프라인 중 만료 키 미복원, 잘린 마지막 줄/깨진 줄 복구, compaction, **`SIGKILL` 후 복구** |
-| `aof-replay-validation.test.js` | 필드가 잘못된 AOF 레코드(키 없음/비문자열 키, 잘못된 tags·만료 시각, 값 누락)를 만나도 죽지 않고 건너뛰어 `skipped` 로 세며, 태그 인덱스가 오염되지 않음 |
+| `aof-replay-validation.test.js` | 필드가 잘못된 AOF 레코드(키 없음/비문자열 키, 잘못된 tags·만료 시각, 값 누락)를 만나도 죽지 않고 건너뛰어 `skipped` 로 세며, 태그 인덱스가 오염되지 않음. 트랜잭션 레코드는 안의 레코드가 하나라도 잘못이면 통째로 건너뜀 (반쪽 복구 없음) |
 | `server.test.js` | CRUD, 특수문자/유니코드/슬래시 키, 만료 후 404, 입력 검증, 413, 인증, **500 동시 INCR / 100 동시 NX / 혼합 동시 요청**, 무효화, 에러 비노출 |
 | `batch.test.js` | `mget`/`mset`(전부 검증 후 반영, 공간 부족 시 무저장, LRU), `scan`(1회씩 순회, prefix, 만료 정리, 순회 중 변경), `transaction`(순서, 사전 검증 → 무실행, 실행 중 오류는 부분 실패) |
 | `batch-aof.test.js` | 트랜잭션/`mset` 이 로그에 한 줄로 기록, **쓰다 만 트랜잭션은 통째로 버려짐**, 재시작 복원 |
