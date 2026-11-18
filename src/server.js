@@ -13,6 +13,11 @@
  *   POST   /keys/:key/incr       { by? }
  *   POST   /invalidate           { key } | { prefix } | { tag } | { all: true }
  *
+ *   POST   /mget                 { keys: [...] }                → { results: [{ key, found, value? }] }
+ *   POST   /mset                 { entries: [{ key, value, ttl?, ttlMs?, tags? }] }   → { stored }  (전부 저장 or 전부 거부)
+ *   GET    /scan?cursor=&count=&prefix=   → { cursor, keys }   (cursor 가 0 으로 돌아오면 끝)
+ *   POST   /transaction          { commands: [{ cmd, key, ... }] }   → { results: [...] }  (끼어들기 없이 연달아 실행)
+ *
  * 키는 URL 경로에 들어가므로 반드시 encodeURIComponent 로 인코딩해서 보낸다.
  * 만료되었거나 무효화된 키는 404 로 응답한다 (값이 응답으로 새어 나가지 않는다).
  *
@@ -100,6 +105,49 @@ export function createServer({
       requireObject(body);
       const invalidated = store.invalidate(body);
       return ok({ invalidated });
+    }
+
+    if (root === 'mget' && parts.length === 1) {
+      allow(method, ['POST']);
+      const body = await readJson(req, maxBodyBytes);
+      requireObject(body);
+      const found = store.mget(body.keys);
+      return ok({
+        results: found.map((f, i) =>
+          f === undefined
+            ? { key: body.keys[i], found: false }
+            : { key: body.keys[i], found: true, value: f.value },
+        ),
+      });
+    }
+
+    if (root === 'mset' && parts.length === 1) {
+      allow(method, ['POST']);
+      const body = await readJson(req, maxBodyBytes);
+      requireObject(body);
+      if (!Array.isArray(body.entries)) throw new InvalidArgumentError('"entries" must be an array');
+      const stored = store.mset(body.entries.map((e, i) => withTtlMs(e, 'entries', i)));
+      return ok({ stored });
+    }
+
+    if (root === 'transaction' && parts.length === 1) {
+      allow(method, ['POST']);
+      const body = await readJson(req, maxBodyBytes);
+      requireObject(body);
+      if (!Array.isArray(body.commands)) throw new InvalidArgumentError('"commands" must be an array');
+      const results = store.transaction(body.commands.map((c, i) => withTtlMs(c, 'commands', i)));
+      return ok({ results });
+    }
+
+    if (root === 'scan' && parts.length === 1) {
+      allow(method, ['GET']);
+      const q = url.searchParams;
+      return ok(
+        store.scan(q.has('cursor') ? Number(q.get('cursor')) : 0, {
+          count: q.has('count') ? Number(q.get('count')) : undefined,
+          prefix: q.get('prefix') ?? '',
+        }),
+      );
     }
 
     if (root === 'keys') {
@@ -232,6 +280,21 @@ function parseLimit(raw) {
     throw new InvalidArgumentError('limit must be an integer between 1 and 10000');
   }
   return n;
+}
+
+/** 배치 항목의 ttl(초) 를 store 가 쓰는 ttlMs 로 바꾼다. 형식 오류에는 "entries[2]: …" 처럼 위치를 붙인다. */
+function withTtlMs(item, name, i) {
+  try {
+    if (item === null || typeof item !== 'object' || Array.isArray(item)) {
+      throw new InvalidArgumentError('must be an object');
+    }
+    const { ttl, ttlMs, ...rest } = item;
+    const ms = parseTtl(item);
+    return ms === undefined ? rest : { ...rest, ttlMs: ms };
+  } catch (err) {
+    if (err instanceof InvalidArgumentError) throw new InvalidArgumentError(`${name}[${i}]: ${err.message}`);
+    throw err;
+  }
 }
 
 /** body 의 ttl(초) / ttlMs 를 ms 로 변환. 둘 다 없으면 undefined. */

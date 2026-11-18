@@ -4,10 +4,12 @@
 **외부 의존성이 없습니다** (Node.js 20+ 내장 모듈만 사용: `node:http`, `node:test`, `fetch`).
 
 ```bash
-npm test            # 단위 + 기능 테스트 (111개)
+npm test            # 단위 + 기능 테스트 (155개)
 npm start           # Mini Redis 서버 (기본 http://127.0.0.1:6380)
 npm run demo        # 데모 API(캐시 적용 :4000 / 캐시 없음 :4001) 실행
 npm run bench       # 캐시 사용 vs 미사용 성능 비교
+npm run bench:batch # 키를 하나씩 vs 배치(mget/mset)로 다룰 때 성능 비교
+npm run demo:tx     # 트랜잭션 없이 이체 vs 트랜잭션 이체 (중간 상태가 보이는지)
 ```
 
 ## 1. 구조
@@ -38,7 +40,7 @@ test/              단위/기능 테스트
 | 버킷 인덱스 | `hash & (capacity - 1)` | 용량을 항상 **2의 거듭제곱**으로 유지 → 나머지(%) 연산 대신 비트 AND |
 | 충돌 해결 | **체이닝** (버킷마다 단일 연결 리스트) | 구현이 단순하고 삭제가 쉽다. 새 노드는 체인 **맨 앞에 삽입 → O(1)** |
 | 리사이즈 | 적재율 > 0.75 → **2배 확장**, < 0.125 → **절반 축소** | 체인 길이를 짧게 유지해 평균 O(1) 보장. 확장/축소 임계값 사이에 간격을 둬서 경계에서 왔다 갔다(thrashing)하지 않음 |
-| 순회 | `scan(cursor, count)` | 만료 키 청소가 한 번에 전체를 훑어 서버를 멈추지 않게 **조금씩** 순회 |
+| 순회 | `scan(cursor, count)` — **역순 이진 증가 커서** | 만료 청소와 `SCAN` API 가 전체를 한 번에 훑어 서버를 멈추지 않게 **조금씩** 순회. 순회 도중 리사이즈가 일어나도 키를 놓치지 않음 |
 
 ### 주요 함수 동작
 
@@ -123,6 +125,7 @@ Redis 와 같은 **두 가지 전략을 함께** 씁니다.
   프로세스만 죽는 경우(`kill -9`)는 `write` 가 끝난 데이터가 OS 캐시에 있으므로 어느 정책이든 보존됩니다 (테스트로 검증).
 - **TTL 은 절대 시각으로 저장** → 서버가 꺼져 있던 동안 만료된 키가 재시작 후 되살아나지 않습니다.
 - **크래시 복구**: 마지막 줄이 쓰다 만 상태면 버리고 파일을 잘라냅니다. 중간에 깨진 줄은 건너뛰고 나머지를 복구합니다.
+- **트랜잭션 / `mset`**: 안의 변경을 `{"o":"t","r":[…]}` **한 줄**로 기록합니다. 한 줄은 "온전히 기록됐거나, 쓰다 만 줄(복구 때 통째로 버려짐)"이라 크래시가 나도 **절반만 복구되지 않습니다**.
 - **Compaction**: 로그가 살아있는 키 수의 2배(최소 1만 줄)를 넘으면 현재 상태만 새 파일로 쓴 뒤 `rename` 으로 **원자적 교체**. 중간에 죽어도 옛 파일이 그대로 남습니다.
 - `SIGINT/SIGTERM` 시 정상 종료하며 fsync 후 닫습니다.
 
@@ -141,6 +144,10 @@ Redis 와 같은 **두 가지 전략을 함께** 씁니다.
 | `POST` | `/keys/:key/incr` | `{ "by": 1 }` | 원자적 증가 (정수 아니면 `409`) |
 | `POST` | `/invalidate` | `{key}` \| `{prefix}` \| `{tag}` \| `{all:true}` | 무효화 → `{ invalidated: n }` |
 | `GET` | `/keys?prefix=&limit=` | | 키 목록 (디버깅/관리용, O(n)) |
+| `POST` | `/mget` | `{ "keys": [...] }` | 여러 키를 한 번에 읽기 → `{ results: [{ key, found, value? }] }` |
+| `POST` | `/mset` | `{ "entries": [{ "key", "value", "ttl", "tags" }] }` | 여러 키를 한 번에 저장 (**전부 저장되거나 전부 거부**) |
+| `GET` | `/scan?cursor=0&count=100&prefix=` | | 커서 기반 키 순회 → `{ cursor, keys }` (cursor 가 `0` 으로 돌아오면 끝) |
+| `POST` | `/transaction` | `{ "commands": [{ "cmd": "incr", "key": "a" }, …] }` | 명령 여러 개를 끼어들기 없이 연달아 실행 |
 | `GET` | `/stats` | | hit/miss, 만료 수, 해시 테이블 상태, AOF 상태 |
 | `GET` | `/health` | | 헬스체크 (인증 불필요) |
 
@@ -153,7 +160,7 @@ curl localhost:6380/keys/user:1
 curl -X POST localhost:6380/invalidate -H 'content-type: application/json' -d '{"tag":"user"}'
 ```
 
-환경변수: `PORT`(6380) `HOST`(127.0.0.1) `AOF_PATH` `FSYNC` `AUTH_TOKEN`(설정 시 `Authorization: Bearer …` 필수) `MAX_KEYS` `EVICTION`(noeviction | lru) `LOG_REQUESTS`.
+환경변수: `PORT`(6380) `HOST`(127.0.0.1) `AOF_PATH` `FSYNC` `AUTH_TOKEN`(설정 시 `Authorization: Bearer …` 필수) `MAX_KEYS` `EVICTION`(noeviction | lru) `MAX_BATCH`(배치/트랜잭션 한 번에 최대 개수, 기본 1000) `LOG_REQUESTS`.
 기본은 **로컬(127.0.0.1)에서만** 열립니다. 외부 공개는 `HOST=0.0.0.0` 과 `AUTH_TOKEN` 을 함께 쓰세요.
 
 ### JS 클라이언트
@@ -175,15 +182,63 @@ const { value, hit } = await cache.getOrSet('product:7', () => db.findProduct(7)
 - **loader 에러는 캐시하지 않고** 그대로 전달
 - **negative caching** — loader 가 `null` 을 반환하면 `null` 도 (짧은 TTL 로) 캐시 → 없는 id 반복 조회로 DB 가 뚫리는 cache penetration 방지
 
-## 8. 테스트 (`npm test` — 111개)
+### 배치 · SCAN · 트랜잭션
+
+**배치 (`mget` / `mset`)** — 키 1,000개를 읽는데 요청 1,000번 대신 1번. 요청마다 붙는 고정 비용(HTTP 헤더, 왕복 지연)을 한 번만 냅니다. 한 번에 실행되므로 `mget` 은 **서로 일관된 스냅샷**이고, `mset` 은 **전부 검증한 뒤 전부 반영**합니다(하나라도 잘못이면 아무것도 저장 안 됨, 공간이 모자라도 마찬가지). 한 번에 최대 1,000개(`MAX_BATCH`) — 단일 스레드라 너무 크면 그동안 다른 요청이 모두 기다립니다.
+
+**SCAN** — `GET /keys` 는 O(n) 전체 순회라 키가 많으면 서버가 멈춥니다. `SCAN` 은 커서로 조금씩 나눠 돌려줍니다.
+
+```bash
+curl "localhost:6380/scan?cursor=0&count=100"      # → {"cursor":8,"keys":[…]}
+curl "localhost:6380/scan?cursor=8&count=100"      # … 돌려받은 cursor 가 0 이면 끝
+```
+
+- 순회를 시작해서 끝낼 때까지 계속 존재한 키는 **최소 한 번** 나옵니다. 순회 도중 테이블이 커지거나 줄어도 마찬가지입니다 (Redis 와 같은 *역순 이진 증가 커서*). 대신 리사이즈가 있었다면 **같은 키가 두 번** 나올 수 있고, 순회 중에 추가·삭제된 키는 나올 수도 안 나올 수도 있습니다.
+- `count` 는 "한 번에 검사할 개수"이지 "반환 개수"가 아닙니다. `prefix` 로 걸러지면 `keys` 가 빈 배열이어도 `cursor` 가 0 이 아니면 계속 호출해야 합니다.
+
+**트랜잭션 (`POST /transaction`)** — 명령 여러 개를 한 요청에 담아 보내면 서버가 **다른 요청이 끼어들지 못하게** 연달아 실행합니다 (명령이 동기 실행이라 가능한 것과 같은 원리).
+
+```bash
+curl -X POST localhost:6380/transaction -H 'content-type: application/json' -d '{"commands":[
+  {"cmd":"incr","key":"acct:a","by":-10},
+  {"cmd":"incr","key":"acct:b","by":10}
+]}'
+# → {"results":[{"ok":true,"value":990},{"ok":true,"value":10}]}
+```
+
+지원 명령: `set` `get` `del` `exists` `incr` `ttl` `expire` `persist` `invalidate`. 규칙은 Redis 의 `MULTI/EXEC` 와 같습니다.
+
+| 상황 | 동작 |
+|---|---|
+| 명령 형식이 잘못됨 (모르는 `cmd`, 잘못된 key/ttl 등) | **아무것도 실행하지 않고** 400 (`commands[1]: …` 처럼 위치 표시) |
+| 실행 중에 실패 (정수 아닌 값에 `incr`, 공간 부족 등) | **롤백하지 않음.** 그 명령만 `{ok:false,error}` 이고 나머지는 계속 실행 |
+| 서버가 중간에 죽음 | AOF 에 한 줄로 기록하므로 **통째로 복구되거나 통째로 버려짐** |
+
+```js
+const [stored, counter, value, failed] = await cache.multi()
+  .set('a', 1).incr('counter').get('a').incr('some-text-key')
+  .exec();                       // failed 는 MiniRedisHttpError 객체
+const values = await cache.mget(['a', 'b', 'c']);            // 없는 키는 undefined
+await cache.mset({ a: 1, b: 2 }, { ttl: 60 });
+for await (const key of cache.scanKeys({ prefix: 'user:' })) { … }
+```
+
+`npm run demo:tx` 로 차이를 볼 수 있습니다: 이체(a 에서 빼고 b 에 더하기)를 요청 2개로 나눠 하면 읽기 300번 중 160번에서 합계가 틀리게 보이고(예: 980), 트랜잭션으로 하면 0번입니다.
+
+`npm run bench:batch`(키 1,000개, 같은 머신의 keep-alive HTTP): 하나씩 읽기 76ms → `mget` 2.3ms, 하나씩 쓰기 111ms → `mset` 2.2ms (약 30~50배). 절대값은 머신마다 다르고, 서버가 원격이면 요청마다 왕복 지연이 붙어 차이가 더 벌어집니다.
+
+## 8. 테스트 (`npm test` — 155개)
 
 | 파일 | 내용 |
 |---|---|
-| `hashtable.test.js` | 해시 벡터, 충돌(체이닝 머리/중간/꼬리 삭제), 확장/축소, 용량 2의 거듭제곱, scan 완전성, 분포, **무작위 연산 5만 회를 `Map` 과 비교하는 속성 테스트** |
+| `hashtable.test.js` | 해시 벡터, 충돌(체이닝 머리/중간/꼬리 삭제), 확장/축소, 용량 2의 거듭제곱, scan 완전성, **scan 도중 확장/축소해도 키를 놓치지 않음**, 분포, **무작위 연산 5만 회를 `Map` 과 비교하는 속성 테스트** |
 | `store.test.js` | 저장/조회/삭제, 타입 보존, null vs 없음, 값 격리, 입력 검증, NX/XX, **가짜 시계로 TTL 경계**, lazy/active 만료, INCR, 무효화(key/prefix/tag/all), maxKeys, 5만 키 |
 | `aof.test.js` | 재시작 복원, 오프라인 중 만료 키 미복원, 잘린 마지막 줄/깨진 줄 복구, compaction, **`SIGKILL` 후 복구** |
 | `aof-replay-validation.test.js` | 필드가 잘못된 AOF 레코드(키 없음/비문자열 키, 잘못된 tags·만료 시각, 값 누락)를 만나도 죽지 않고 건너뛰어 `skipped` 로 세며, 태그 인덱스가 오염되지 않음 |
 | `server.test.js` | CRUD, 특수문자/유니코드/슬래시 키, 만료 후 404, 입력 검증, 413, 인증, **500 동시 INCR / 100 동시 NX / 혼합 동시 요청**, 무효화, 에러 비노출 |
+| `batch.test.js` | `mget`/`mset`(전부 검증 후 반영, 공간 부족 시 무저장, LRU), `scan`(1회씩 순회, prefix, 만료 정리, 순회 중 변경), `transaction`(순서, 사전 검증 → 무실행, 실행 중 오류는 부분 실패) |
+| `batch-aof.test.js` | 트랜잭션/`mset` 이 로그에 한 줄로 기록, **쓰다 만 트랜잭션은 통째로 버려짐**, 재시작 복원 |
+| `batch-http.test.js` | 새 엔드포인트와 클라이언트 + **동시성**: 100개 트랜잭션이 서로 끼어들지 않음 / 이체 중에도 `mget` 합계가 항상 일정 / 겹치는 `mset` 이 섞이지 않음 |
 | `client.test.js` | 클라이언트 전 기능, stampede, fail-open(서버 다운 / 응답 없음), negative caching, **데모 API 연동**(HIT/MISS, 수정 시 무효화, 태그 무효화, TTL 만료 후 재조회) |
 
 ## 9. 성능 비교 — 캐시 사용 vs 미사용 (`npm run bench`)
@@ -216,5 +271,7 @@ const { value, hit } = await cache.getOrSet('product:7', () => db.findProduct(7)
 - 값은 **JSON 직렬화 가능한 것만** (`NaN`/함수/`undefined`/BigInt 는 거부). 중첩된 `Date` 는 문자열로 바뀝니다.
 - 키 `"."` 와 `".."` 는 URL 표준이 경로를 정규화하므로 `fetch` 기반 클라이언트로는 전달할 수 없습니다 (클라이언트가 명시적으로 거부. 날것의 HTTP 로는 동작).
 - 메모리 상한은 `MAX_KEYS`(키 **개수**)뿐이고 값의 바이트 크기는 따지지 않습니다. 축출 정책은 `noeviction` 과 `lru` 두 가지뿐입니다 (LFU 등 없음). LRU 는 정확한 LRU 이지만, 읽기 순서는 AOF 에 남지 않습니다.
-- `prefix` 무효화와 `GET /keys` 는 O(n).
+- `prefix` 무효화와 `GET /keys` 는 O(n). (`SCAN` 으로 나눠 돌 수 있지만 무효화는 아직 한 번에 처리)
+- 트랜잭션은 **롤백이 없고**, 낙관적 락(`WATCH`)도 없습니다. 읽고 → 클라이언트에서 판단하고 → 쓰는 로직을 원자적으로 만들려면 `incr`/`set nx` 같은 단일 명령을 쓰세요. HTTP 는 요청 단위라 Redis 처럼 `MULTI` 로 세션을 열어 두는 방식은 없고, 한 요청에 명령을 모두 담습니다.
+- `SCAN` 은 리사이즈가 있으면 같은 키를 두 번 돌려줄 수 있습니다 (빠뜨리지는 않음).
 - 태그 보조 인덱스는 내장 `Map` 을 사용합니다 (메인 키-값 저장소만 직접 만든 해시 테이블).

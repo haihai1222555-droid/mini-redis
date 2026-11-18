@@ -16,6 +16,42 @@ export class MiniRedisHttpError extends Error {
   }
 }
 
+/** cache.multi() 가 돌려주는 명령 모음. exec() 를 호출할 때 비로소 서버로 전송된다. */
+export class MiniRedisTransaction {
+  #commands = [];
+  #send;
+
+  constructor(send) {
+    this.#send = send;
+  }
+
+  #add(command) {
+    this.#commands.push(command);
+    return this;
+  }
+
+  /** opts: { ttl(초), ttlMs, tags, nx, xx } */
+  set(key, value, opts = {}) { return this.#add({ ...opts, cmd: 'set', key, value }); }
+  get(key) { return this.#add({ cmd: 'get', key }); }
+  del(key) { return this.#add({ cmd: 'del', key }); }
+  exists(key) { return this.#add({ cmd: 'exists', key }); }
+  incr(key, by = 1) { return this.#add({ cmd: 'incr', key, by }); }
+  ttl(key) { return this.#add({ cmd: 'ttl', key }); }
+  expire(key, ttlSeconds) { return this.#add({ cmd: 'expire', key, ttl: ttlSeconds }); }
+  persist(key) { return this.#add({ cmd: 'persist', key }); }
+  /** @param {{ key?: string, prefix?: string, tag?: string, all?: boolean }} criteria */
+  invalidate(criteria) { return this.#add({ ...criteria, cmd: 'invalidate' }); }
+
+  get length() {
+    return this.#commands.length;
+  }
+
+  async exec() {
+    if (this.#commands.length === 0) return [];
+    return this.#send(this.#commands);
+  }
+}
+
 export class MiniRedisClient {
   #baseUrl;
   #token;
@@ -138,6 +174,96 @@ export class MiniRedisClient {
     const res = await this.#request('POST', '/invalidate', criteria);
     this.#throwIfError(res);
     return res.json.invalidated;
+  }
+
+  // ───────────── 배치 / SCAN / 트랜잭션 ─────────────
+
+  /**
+   * 여러 키를 한 번의 요청으로 읽는다 (왕복 1회, 서로 일관된 스냅샷).
+   * @returns {Promise<Array<*>>} keys 와 같은 순서. 없거나 만료된 키는 undefined (저장된 null 과 구분됨)
+   */
+  async mget(keys) {
+    const res = await this.#request('POST', '/mget', { keys });
+    this.#throwIfError(res);
+    return res.json.results.map((r) => (r.found ? r.value : undefined));
+  }
+
+  /**
+   * 여러 키를 한 번의 요청으로 저장한다. 전부 저장되거나 전부 거부된다.
+   *   mset({ a: 1, b: 2 }, { ttl: 60, tags: ['t'] })                      // 객체 형태: 옵션은 전체에 적용
+   *   mset([{ key: 'a', value: 1, ttl: 10 }, { key: 'b', value: 2 }])     // 배열 형태: 항목별 옵션
+   * @returns {Promise<number>} 저장한 개수
+   */
+  async mset(entries, opts = {}) {
+    const list = Array.isArray(entries)
+      ? entries
+      : Object.entries(entries).map(([key, value]) => ({ key, value, ...opts }));
+    const res = await this.#request('POST', '/mset', { entries: list });
+    this.#throwIfError(res);
+    return res.json.stored;
+  }
+
+  /**
+   * 커서 기반 키 순회 한 페이지. cursor 0 으로 시작해서 돌려받은 cursor 가 0 이면 끝.
+   * prefix 로 걸러지면 keys 가 비어 있어도 cursor 가 0 이 아니면 계속 호출해야 한다.
+   * @returns {Promise<{ cursor: number, keys: string[] }>}
+   */
+  async scan(cursor = 0, { count, prefix = '' } = {}) {
+    const q = new URLSearchParams({ cursor: String(cursor), prefix });
+    if (count !== undefined) q.set('count', String(count));
+    const res = await this.#request('GET', `/scan?${q}`);
+    this.#throwIfError(res);
+    return res.json;
+  }
+
+  /**
+   * 모든 키를 한 번에 하나씩 비동기로 순회한다. (for await (const key of cache.scanKeys()) …)
+   * 순회 중 서버 테이블이 리사이즈되면 같은 키가 두 번 나올 수 있다 (빠지는 키는 없다).
+   */
+  async *scanKeys({ count = 100, prefix = '' } = {}) {
+    let cursor = 0;
+    do {
+      const page = await this.scan(cursor, { count, prefix });
+      yield* page.keys;
+      cursor = page.cursor;
+    } while (cursor !== 0);
+  }
+
+  /**
+   * 트랜잭션: 여러 명령을 한 요청으로 보내 끼어들기 없이 연달아 실행한다.
+   *
+   *   const [stored, count, value] = await cache.multi()
+   *     .set('a', 1)
+   *     .incr('counter')
+   *     .get('a')
+   *     .exec();
+   *
+   * - 결과는 명령 순서대로. 실행 중 실패한 명령(예: 정수가 아닌 값에 incr)은 값 자리에
+   *   MiniRedisHttpError 객체가 들어가고(롤백은 없다), 나머지 명령은 그대로 실행된다.
+   * - 형식이 잘못된 명령이 하나라도 있으면 아무것도 실행되지 않고 exec() 가 throw 한다.
+   */
+  multi() {
+    return new MiniRedisTransaction((commands) => this.#transaction(commands));
+  }
+
+  async #transaction(commands) {
+    const res = await this.#request('POST', '/transaction', { commands });
+    this.#throwIfError(res);
+    return res.json.results.map((r, i) => {
+      if (!r.ok) return new MiniRedisHttpError(r.error.status, r.error.code, r.error.message);
+      switch (commands[i].cmd) {
+        case 'set': return r.stored;
+        case 'get': return r.found ? r.value : undefined;
+        case 'del': return r.deleted;
+        case 'exists': return r.exists;
+        case 'incr': return r.value;
+        case 'ttl': return r.found ? r.ttlMs : undefined;
+        case 'expire': return r.updated;
+        case 'persist': return r.persisted;
+        case 'invalidate': return r.invalidated;
+        default: return r;
+      }
+    });
   }
 
   async stats() {

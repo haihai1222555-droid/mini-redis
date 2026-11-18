@@ -165,3 +165,68 @@ test('속성 테스트: 무작위 연산 결과가 Map 과 항상 일치', () =>
   }
   assert.deepEqual([...table].sort(), [...oracle].sort());
 });
+
+// ───────────── scan: 역순 이진 커서 ─────────────
+
+test('scan: 역순 이진 커서 — 버킷을 상위 비트부터 방문 (용량 16: 0, 8, 4, 12, 2, 10, …)', () => {
+  const t = new HashTable({ hash: (k) => Number(k) }); // 해시 = 키 숫자 → 버킷 번호가 곧 키
+  for (let i = 0; i < 12; i++) t.set(String(i), i); // 12/16 = 0.75 → 확장되지 않음
+  assert.equal(t.capacity, 16);
+
+  const order = [];
+  let cursor = 0;
+  do {
+    const r = t.scan(cursor, 1); // 한 번에 키 1개씩
+    for (const [k] of r.entries) order.push(Number(k));
+    cursor = r.cursor;
+  } while (cursor !== 0);
+
+  // 전체 방문 순서 [0,8,4,12,2,10,6,14,1,9,5,13,3,11,7,15] 에서 키가 있는 버킷(0~11)만
+  assert.deepEqual(order, [0, 8, 4, 2, 10, 6, 1, 9, 5, 3, 11, 7]);
+});
+
+test('scan: 순회 도중 테이블이 커져도 처음부터 있던 키는 빠짐없이 반환', () => {
+  const t = new HashTable();
+  const original = Array.from({ length: 500 }, (_, i) => `orig:${i}`);
+  for (const k of original) t.set(k, 1);
+  const startCapacity = t.capacity;
+  const seen = new Set();
+  let cursor = 0;
+  let pages = 0;
+  let extra = 0;
+  do {
+    const r = t.scan(cursor, 7);
+    for (const [k] of r.entries) seen.add(k);
+    cursor = r.cursor;
+    if (pages++ < 30) for (let j = 0; j < 20; j++) t.set(`new:${extra++}`, 1); // 순회 중에 키를 계속 추가
+  } while (cursor !== 0);
+  assert.ok(t.capacity > startCapacity, '순회 중에 확장이 일어나야 이 테스트가 의미가 있다');
+  for (const k of original) assert.ok(seen.has(k), `missed ${k}`);
+});
+
+test('scan: 순회 도중 테이블이 줄어도 남아있는 키는 빠짐없이 반환', () => {
+  const t = new HashTable();
+  const keep = Array.from({ length: 20 }, (_, i) => `keep:${i}`);
+  const drop = Array.from({ length: 3000 }, (_, i) => `drop:${i}`);
+  for (const k of keep) t.set(k, 1);
+  for (const k of drop) t.set(k, 1);
+  const startCapacity = t.capacity;
+  const seen = new Set();
+  let cursor = 0;
+  let next = 0;
+  do {
+    const r = t.scan(cursor, 10);
+    for (const [k] of r.entries) seen.add(k);
+    cursor = r.cursor;
+    for (let j = 0; j < 100 && next < drop.length; j++) t.delete(drop[next++]); // 순회 중에 계속 삭제 → 여러 번 축소
+  } while (cursor !== 0);
+  assert.ok(t.capacity < startCapacity, '순회 중에 축소가 일어나야 이 테스트가 의미가 있다');
+  for (const k of keep) assert.ok(seen.has(k), `missed ${k}`);
+});
+
+test('scan: 용량보다 큰 커서(리사이즈 전에 받은 값)도 안전하게 처리', () => {
+  const t = new HashTable();
+  for (let i = 0; i < 10; i++) t.set(`k${i}`, i);
+  const r = t.scan(0xffffffff, 5);
+  assert.ok(Number.isInteger(r.cursor) && r.cursor >= 0 && r.cursor <= 0xffffffff);
+});
