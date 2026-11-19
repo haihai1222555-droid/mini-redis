@@ -14,7 +14,8 @@
     "bench:hashtable": "node bench/hashtable-bench.js",
     "test": "node --test \"test/**/*.test.js\"",
     "bench:batch": "node bench/batch-bench.js",
-    "demo:tx": "node examples/transaction-demo.js"
+    "demo:tx": "node examples/transaction-demo.js",
+    "bench:before-after": "node bench/before-after.js"
   },
   "license": "MIT"
 }
